@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Browser profile (cookies, session data — do NOT share)
+.browser_profile/
+
+# Runtime artifacts
+playwright_code.log
+scrape_log.json
+*.png
+
+# Secrets
+.env
+*.env
