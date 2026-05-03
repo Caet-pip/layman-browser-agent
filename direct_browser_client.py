@@ -197,10 +197,7 @@ class DirectBrowserClient:
 
     async def _snapshot(self, args: dict) -> tuple[str, list]:
         # Request refs so the LLM can reference elements in follow-up calls
-        try:
-            snap = await self._page.locator("body").aria_snapshot(ref=True)
-        except TypeError:
-            snap = await self._page.locator("body").aria_snapshot()
+        snap = await self._page.locator("body").aria_snapshot()
         state = await self._page_state()
         return f"{state}\n\n{snap}", []
 

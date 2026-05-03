@@ -7,10 +7,12 @@ from agent import BrowserAgent
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["ollama", "openai"], help="LLM backend to use")
-    parser.add_argument("--browser", choices=["direct", "playwright", "cdp"], default="direct", help="Browser client to use (default: direct)")
+    parser.add_argument("--model", help="Override the model name (e.g. llama3.2, qwen2.5, gpt-4o-mini)")
+    parser.add_argument("--browser", choices=["direct", "cdp", "cdp-mcp", "playwright"], default="cdp", help="Browser client to use (default: cdp)")
+    parser.add_argument("--visible-mouse", action="store_true", help="Show visible cursor during clicks")
     args = parser.parse_args()
 
-    agent = BrowserAgent(backend=args.backend, browser=args.browser)
+    agent = BrowserAgent(backend=args.backend, model=args.model, browser=args.browser, visible_mouse=args.visible_mouse)
     await agent.connect()
 
     print("Browser agent ready. Type your task, or 'exit' to quit.\n")

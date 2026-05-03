@@ -2,12 +2,14 @@ import json
 import os
 import time
 import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from openai import OpenAI
 from mcp_client import BrowserMCPClient  # wraps both @playwright/mcp and chrome-devtools-mcp
 from direct_browser_client import DirectBrowserClient
+from cdp_browser_client import CDPBrowserClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -16,25 +18,25 @@ BACKENDS = {
         "base_url":     "http://localhost:11434/v1",
         "api_key":      "ollama",
         "model":        "gemma4:31b-cloud",
-        "max_snapshot": 6_000,
+        "max_snapshot": 8_000,
     },
     "openai": {
         "base_url":     None,
         "api_key":      os.getenv("OPENAI_API_KEY", ""),
         "model":        "gpt-4o",
-        "max_snapshot": None,
+        "max_snapshot": 16_000,
     },
 }
 
 MAX_STEPS        = 100
 MAX_JUDGE_ROUNDS = 3
 PLAYWRIGHT_LOG   = Path(__file__).parent / "playwright_code.log"
+STATE_LOG        = Path(__file__).parent / "state_messages.json"
+CONTEXT_LOG      = Path(__file__).parent / "context_window.json"
 
 # Context window settings
-TOOL_RESULT_MAX       = 4000
 TOOL_RESULT_KEEP_FULL = 6
-TOOL_RESULT_TRIM_TO   = 300
-ROLLING_WINDOW        = 40
+TOKEN_BUDGET          = 80_000   # max tokens sent to LLM per turn
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -48,7 +50,12 @@ Core rules:
 - Always take a fresh snapshot before any click, type, or interaction — refs go stale after navigation or page updates.
 - After every navigation or page change, snapshot immediately to confirm where you are before doing anything else.
 - Scroll frequently. Content is often below the fold or lazy-loaded.
-- When writing browser_run_code, write Python async Playwright code. `page` and `context` are available. Use `await` for all calls."""
+- When writing browser_run_code, write Python async Playwright code. `page` and `context` are available. Use `await` for all calls.
+- Never call browser_navigate or browser_click more than once per turn. These change page state — parallel calls conflict. One action per step, then snapshot.
+- If you get "not in snapshot" on a click, take a fresh snapshot immediately — do NOT retry the same index.
+- Never navigate to a brand homepage (e.g. stevemadden.com, nike.com). Stay on aggregator/category pages like Zappos or Amazon where products are directly listed and clickable.
+- If a popup or modal appears, close it first before doing anything else — look for a close/dismiss button in the snapshot and click it.
+- Never construct or guess a URL from memory. Only navigate to URLs that are visible in the current page snapshot or search results."""
 
 ASK_HUMAN_TOOL = {
     "type": "function",
@@ -76,14 +83,26 @@ TASK_MODES: dict[str, dict] = {
         "description": "User wants to find, compare, or buy products - prices, deals, recommendations.",
         "prompt": """
 SHOPPING MODE — follow these steps exactly:
-1. Search for the item on Google or a shopping site.
-2. From the search/listing page, pick 3-5 specific products that look promising.
-3. For EACH product: open a NEW TAB first, then navigate to the product URL in that tab. Never open products in the same tab.
-4. On each product page: scroll down to see full details, price, and reviews. Take a screenshot.
-5. After visiting ALL product pages, write your final answer with: product name, price, rating, key specs, and the URL where you saw it.
-- A search results page or listing grid is NOT a product page. You must click through.
-- Do not give a final answer until you have visited at least 3 individual product pages.""",
-        "judge_extra": "STRICT CHECK: The agent must have opened at least 3 individual product pages IN SEPARATE TABS (not google.com, not search result pages, not category listings). Each product page must be a distinct URL on a retailer site. If the visited URLs are all google.com or search pages, the answer is NOT sufficient.",
+
+STEP 0 — before doing anything, decide what columns to track based on the goal:
+- Price comparison goal → columns: Store | Product | Price | Availability
+- Style/aesthetic goal → columns: Store | Product | Description | Style notes | Price
+- Feature comparison goal → columns: Store | Product | Key specs | Price | Rating
+Output the empty table with headers immediately so you know what to fill in.
+
+STEP 1 — Search for the item. Use Google Shopping or go directly to Amazon/Zappos/eBay.
+STEP 2 — From the search results, click a product link directly (do not construct URLs from memory).
+STEP 3 — On the product page: scroll down to see full price, availability, and details.
+STEP 4 — Add a row to your comparison table with what you found on this store.
+STEP 5 — Navigate back and repeat for the next store. Visit at least 3 different stores.
+STEP 6 — After 3+ stores, use the completed table to write your final recommendation.
+
+Rules:
+- Never construct or guess a URL. Only navigate to URLs visible in the current snapshot or search results.
+- Never open new tabs. Visit stores one at a time in the same tab, use browser_back to return.
+- A search results page is NOT a product page — click through to the actual item.
+- Update the comparison table after EVERY store visit, not at the end.""",
+        "judge_extra": "STRICT CHECK: The agent must have visited at least 3 individual product pages on distinct retailer sites (not google.com, not search result pages). The final answer must include a comparison table with real prices/details found by actually visiting each page.",
     },
     "research": {
         "description": "User wants to learn, investigate, or understand a topic.",
@@ -97,6 +116,19 @@ RESEARCH MODE:
     },
 }
 
+# ── State ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AgentState:
+    task: str = ""
+    messages: list[dict] = field(default_factory=list)
+    visited_urls: list[str] = field(default_factory=list)
+    evidence: list[dict] = field(default_factory=list)
+    judge_rounds: int = 0
+    summary_cache: dict = field(default_factory=dict)
+    tool_outputs: dict = field(default_factory=dict)  # new tools drop structured output here
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _count_tokens(messages: list[dict]) -> int:
@@ -106,7 +138,7 @@ def _count_tokens(messages: list[dict]) -> int:
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 class BrowserAgent:
-    def __init__(self, backend: str | None = None, model: str | None = None, browser: str = "direct"):
+    def __init__(self, backend: str | None = None, model: str | None = None, browser: str = "direct", visible_mouse: bool = False):
         b = backend or os.getenv("AGENT_BACKEND", "ollama")
         cfg = BACKENDS[b]
         self.model         = model or cfg["model"]
@@ -118,16 +150,15 @@ class BrowserAgent:
         if browser == "direct":
             self.browser = DirectBrowserClient()
         elif browser == "cdp":
+            self.browser = CDPBrowserClient(visible_mouse=visible_mouse)
+        elif browser == "cdp-mcp":
             self.browser = BrowserMCPClient(server="cdp")
         else:
             self.browser = BrowserMCPClient(server="playwright")
 
-        self.tools: list[dict]       = []
-        self.messages: list[dict]    = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self._summary_cache: dict     = {}
-        self._visited_urls: list[str]  = []
-        self._evidence: list[dict]     = []  # {url, screenshot_path, note}
-        self._current_mode: str | None = None
+        self.tools: list[dict] = []
+        self.mode: str | None = None
+        self.state = AgentState(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
 
         print(f"[Agent] Backend: {b} | Model: {self.model} | Browser: {browser}")
 
@@ -155,15 +186,15 @@ class BrowserAgent:
         return result if result in TASK_MODES else None
 
     def set_mode(self, mode: str | None):
-        self._current_mode = mode
+        self.mode = mode
         mode_cfg       = TASK_MODES.get(mode, {}) if mode else {}
         system_content = SYSTEM_PROMPT + mode_cfg.get("prompt", "")
-        self.messages  = [m for m in self.messages if m["role"] != "system"]
-        self.messages.insert(0, {"role": "system", "content": system_content})
+        self.state.messages = [m for m in self.state.messages if m["role"] != "system"]
+        self.state.messages.insert(0, {"role": "system", "content": system_content})
         print(f"[Mode] {mode or 'none'}")
 
     def is_continuation(self, task: str) -> bool:
-        non_system = [m for m in self.messages if m["role"] != "system"]
+        non_system = [m for m in self.state.messages if m["role"] != "system"]
         if not non_system:
             return False
         recent   = json.dumps(non_system[-4:], indent=2)
@@ -179,8 +210,8 @@ class BrowserAgent:
         url = url.strip()
         if not url or url in ("about:blank", ""):
             return
-        if not self._visited_urls or self._visited_urls[-1] != url:
-            self._visited_urls.append(url)
+        if not self.state.visited_urls or self.state.visited_urls[-1] != url:
+            self.state.visited_urls.append(url)
             print(f"[URL] {url}")
 
     # ── Context ────────────────────────────────────────────────────────────────
@@ -206,28 +237,102 @@ class BrowserAgent:
         if snippet_lines: parts.append("Snapshot: " + " | ".join(snippet_lines))
         return " — ".join(parts) if parts else content[:200]
 
-    def _build_context(self) -> list[dict]:
-        system = [m for m in self.messages if m["role"] == "system"]
-        rest   = [m for m in self.messages if m["role"] != "system"]
-        rest   = rest[-ROLLING_WINDOW:]
+    def _group_messages(self, messages: list[dict]) -> list[list[dict]]:
+        """Group flat message list into logical units — each a complete pair or standalone."""
+        groups = []
+        i = 0
+        while i < len(messages):
+            m = messages[i]
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                ids = {tc["id"] for tc in m["tool_calls"]}
+                pair = [m]
+                i += 1
+                while i < len(messages) and messages[i]["role"] == "tool":
+                    if messages[i].get("tool_call_id") in ids:
+                        pair.append(messages[i])
+                        ids.discard(messages[i]["tool_call_id"])
+                    i += 1
+                groups.append(pair)
+            else:
+                groups.append([m])
+                i += 1
+        return groups
 
-        tool_indices = [i for i, m in enumerate(rest) if m["role"] == "tool"]
-        cutoff = tool_indices[-TOOL_RESULT_KEEP_FULL] if len(tool_indices) > TOOL_RESULT_KEEP_FULL else 0
+    def _build_context(self) -> list[dict]:
+        system   = [m for m in self.state.messages if m["role"] == "system"]
+        rest     = [m for m in self.state.messages if m["role"] != "system"]
+
+        groups   = self._group_messages(rest)
+
+        # Pin first user message, trim from the middle by dropping oldest pairs
+        pinned    = groups[:1] if groups else []
+        trimmable = groups[1:]
+
+        def _tokens(gs):
+            return _count_tokens([m for g in gs for m in g])
+
+        while _tokens(pinned + trimmable) > TOKEN_BUDGET and len(trimmable) > 1:
+            trimmable.pop(0)
+
+        kept = pinned + trimmable
+
+        # Summarize tool results in older pairs, keep last TOOL_RESULT_KEEP_FULL pairs full
+        tool_pairs = [g for g in kept if any(m["role"] == "tool" for m in g)]
+        cutoff_pairs = set(
+            id(g) for g in tool_pairs[:-TOOL_RESULT_KEEP_FULL]
+        ) if len(tool_pairs) > TOOL_RESULT_KEEP_FULL else set()
 
         trimmed = []
-        for i, m in enumerate(rest):
-            if i < cutoff and m["role"] == "tool":
-                tc_id = m.get("tool_call_id", "")
-                if tc_id not in self._summary_cache:
-                    self._summary_cache[tc_id] = self._summarize_tool_result(m["content"] or "")
-                    print(f"[Summary] {self._summary_cache[tc_id]}")
-                m = {**m, "content": self._summary_cache[tc_id]}
-            trimmed.append(m)
+        for group in kept:
+            if id(group) in cutoff_pairs:
+                summarized = []
+                for m in group:
+                    if m["role"] == "tool":
+                        tc_id = m.get("tool_call_id", "")
+                        if tc_id not in self.state.summary_cache:
+                            self.state.summary_cache[tc_id] = self._summarize_tool_result(m["content"] or "")
+                            print(f"[Summary] {self.state.summary_cache[tc_id]}")
+                        m = {**m, "content": self.state.summary_cache[tc_id]}
+                    summarized.append(m)
+                trimmed.extend(summarized)
+            else:
+                trimmed.extend(group)
 
-        valid_ids = {tc["id"] for m in trimmed if m["role"] == "assistant" for tc in m.get("tool_calls", [])}
-        trimmed   = [m for m in trimmed if not (m["role"] == "tool" and m.get("tool_call_id") not in valid_ids)]
+        context = system + trimmed
+        STATE_LOG.write_text(json.dumps(self.state.messages, indent=2))
+        CONTEXT_LOG.write_text(json.dumps(context, indent=2))
+        return context
 
-        return system + trimmed
+    def _heal_messages(self):
+        """Remove any trailing incomplete tool call pairs from state.messages.
+        Called at the start of each run() to fix state left by a previous crash."""
+        msgs = self.state.messages
+        while msgs:
+            last = msgs[-1]
+            if last["role"] == "assistant" and last.get("tool_calls"):
+                expected = {tc["id"] for tc in last["tool_calls"]}
+                # check how many results follow — there are none since it's the last message
+                msgs.pop()
+                print(f"[Heal] Removed incomplete assistant tool_calls with no results: {[tc['function']['name'] for tc in last['tool_calls']]}")
+            elif last["role"] == "tool":
+                # walk back to find the assistant message and check if all results are present
+                tool_ids_present = set()
+                i = len(msgs) - 1
+                while i >= 0 and msgs[i]["role"] == "tool":
+                    tool_ids_present.add(msgs[i].get("tool_call_id"))
+                    i -= 1
+                if i >= 0 and msgs[i]["role"] == "assistant" and msgs[i].get("tool_calls"):
+                    expected = {tc["id"] for tc in msgs[i]["tool_calls"]}
+                    if tool_ids_present == expected:
+                        break  # pair is complete, stop healing
+                    # partial results — remove all of them plus the assistant message
+                    while len(msgs) > i:
+                        msgs.pop()
+                    print(f"[Heal] Removed partial tool call pair")
+                else:
+                    break
+            else:
+                break
 
     # ── LLM calls ─────────────────────────────────────────────────────────────
 
@@ -241,10 +346,10 @@ class BrowserAgent:
         return response.choices[0].message
 
     def _judge(self, task: str, answer: str, judge_extra: str = "") -> tuple[bool, str]:
-        visited = "\n".join(f"- {u}" for u in self._visited_urls) or "- (no pages visited)"
+        visited = "\n".join(f"- {u}" for u in self.state.visited_urls) or "- (no pages visited)"
         evidence_lines = "\n".join(
-            f"- screenshot: {e['screenshot']} (at {e['url']})" for e in self._evidence
-        ) if self._evidence else "- (no screenshots captured)"
+            f"- screenshot: {e['screenshot']} (at {e['url']})" for e in self.state.evidence
+        ) if self.state.evidence else "- (no screenshots captured)"
         extra = f"\nMODE-SPECIFIC CRITERIA:\n{judge_extra}" if judge_extra else ""
         prompt = f"""You are a strict judge evaluating a browser agent's answer.
 
@@ -285,39 +390,44 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
             return
 
         print(f"[Screenshot] auto after {trigger}")
+        self._heal_messages()
         context = self._build_context()
         context.append({"role": "user", "content": [
-            {"type": "text", "text": "Screenshot taken after last action. Confirm what page you are on and whether it looks correct. Be brief."},
+            {"type": "text", "text": "Screenshot taken after last action. Reply in one sentence describing what page you are on. Do not call any tools. Plain text only."},
             *images,
         ]})
-        t0       = time.time()
+        t0 = time.time()
+        # No tools passed — prevents model from outputting tool call syntax
         response = self.llm.chat.completions.create(model=self.model, messages=context)
         print(f"[Time] LLM (screenshot check): {time.time() - t0:.1f}s")
-        confirmation = response.choices[0].message.content or f"[confirmed after {trigger}]"
+        confirmation = response.choices[0].message.content or ""
+        # If model still output tool call syntax, replace with a neutral placeholder
+        if not confirmation or confirmation.strip().startswith("call:") or "tool_call" in confirmation:
+            confirmation = f"[page confirmed after {trigger}]"
         print(f"[Screenshot] {confirmation[:120]}")
-        self.messages.append({"role": "user", "content": f"[Visual check after {trigger}]: {confirmation}"})
+        self.state.messages.append({"role": "user", "content": f"[Visual check after {trigger}]: {confirmation}"})
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
-    async def _execute_tool(self, tc, task: str) -> None:
+    async def _execute_tool(self, tc, task: str) -> dict | None:
+        """Execute one tool call. Returns the tool result dict (to be appended by caller),
+        or None for ask_human (which appends directly and is always a single call)."""
         name = tc.function.name
         args = json.loads(tc.function.arguments)
 
-        # Track URLs from navigate args (Playwright MCP)
+        # Track URLs from navigate args
         if name == "browser_navigate" and "url" in args:
             self._track_url(args["url"])
-
-        # Track URLs from CDP navigate/new_page args
         if name in ("navigate_page", "new_page") and "url" in args:
             self._track_url(args["url"])
 
-        # ask_human is handled locally, not sent to browser
+        # ask_human is handled locally — always a single call, safe to append directly
         if name == "ask_human":
             print(f"\n[Agent asks] {args.get('question', '')}")
             human_response = input("Your answer: ").strip()
             print()
-            self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": human_response})
-            return
+            self.state.messages.append({"role": "tool", "tool_call_id": tc.id, "content": human_response})
+            return None
 
         # Log browser_run_code to file instead of console
         if name == "browser_run_code":
@@ -347,7 +457,7 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         )
         print(f"[Tool] → {raw_len} chars | {preview}")
 
-        # Track URLs from tool result text — handles both Playwright (Page URL:) and CDP (url="...")
+        # Track URLs from tool result text
         for line in text.splitlines():
             if "Page URL:" in line:
                 self._track_url(line.split("Page URL:")[-1].strip())
@@ -359,27 +469,29 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         if name in ("take_screenshot", "browser_take_screenshot"):
             path = args.get("filePath", "")
             if path:
-                current_url = self._visited_urls[-1] if self._visited_urls else ""
-                self._evidence.append({"url": current_url, "screenshot": path})
+                current_url = self.state.visited_urls[-1] if self.state.visited_urls else ""
+                self.state.evidence.append({"url": current_url, "screenshot": path})
                 print(f"[Evidence] screenshot saved: {path}")
 
-        self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": text})
-
-        # Auto-screenshot after navigation/clicks
-        if images or name in ("browser_navigate", "browser_click"):
-            await self._check_screenshot(name, images)
+        return {"role": "tool", "tool_call_id": tc.id, "content": text, "_images": images, "_name": name}
 
     # ── Core loop ─────────────────────────────────────────────────────────────
 
     async def run(self, task: str) -> str:
         print(f"[Agent] Task: {task}\n")
-        self.messages.append({"role": "user", "content": task})
-        self._visited_urls = []
-        self._evidence     = []
-        judge_extra  = TASK_MODES.get(self._current_mode, {}).get("judge_extra", "") if self._current_mode else ""
-        judge_rounds = 0
+
+        self.state.task = task
+        self.state.visited_urls = []
+        self.state.evidence = []
+        self.state.judge_rounds = 0
+        self.state.tool_outputs = {}
+        self._heal_messages()
+        self.state.messages.append({"role": "user", "content": task})
+
+        judge_extra = TASK_MODES.get(self.mode, {}).get("judge_extra", "") if self.mode else ""
 
         for step in range(MAX_STEPS):
+            self._heal_messages()
             context = self._build_context()
             print(f"[Context] {len(context)} messages | ~{_count_tokens(context):,} tokens")
 
@@ -387,30 +499,43 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
 
             # ── No tool calls: agent proposes an answer ──
             if not message.tool_calls:
-                self.messages.append({"role": "assistant", "content": message.content})
+                self.state.messages.append({"role": "assistant", "content": message.content})
                 print(f"\n[Agent] Proposed answer after {step + 1} step(s)")
 
-                if judge_rounds < MAX_JUDGE_ROUNDS:
+                if self.state.judge_rounds < MAX_JUDGE_ROUNDS:
                     sufficient, feedback = self._judge(task, message.content, judge_extra)
-                    judge_rounds += 1
+                    self.state.judge_rounds += 1
                     if not sufficient:
-                        self.messages.append({"role": "user", "content": f"[Judge feedback] {feedback} Please continue researching."})
+                        self.state.messages.append({"role": "user", "content": f"[Judge feedback] {feedback} Please continue researching."})
                         continue
 
-                print(f"[Agent] Done (judge rounds: {judge_rounds})")
+                print(f"[Agent] Done (judge rounds: {self.state.judge_rounds})")
                 return message.content
 
-            # ── Tool calls: execute each and loop ──
-            self.messages.append({
+            # ── Tool calls: execute all, then append atomically ──
+            assistant_msg = {
                 "role": "assistant",
                 "content": message.content or "",
                 "tool_calls": [
                     {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in message.tool_calls
                 ],
-            })
+            }
 
+            results = []
             for tc in message.tool_calls:
-                await self._execute_tool(tc, task)
+                result = await self._execute_tool(tc, task)
+                if result is not None:
+                    results.append(result)
+
+            # Commit assistant message + all results together — never a partial pair
+            self.state.messages.append(assistant_msg)
+            for r in results:
+                self.state.messages.append({"role": "tool", "tool_call_id": r["tool_call_id"], "content": r["content"]})
+
+            # Run screenshot checks after the pair is committed
+            for r in results:
+                if r["_images"] or r["_name"] in ("browser_navigate", "browser_click"):
+                    await self._check_screenshot(r["_name"], r["_images"])
 
         return "Reached max steps without completing the task."
