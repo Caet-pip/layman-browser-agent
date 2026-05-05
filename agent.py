@@ -23,7 +23,7 @@ BACKENDS = {
     "openai": {
         "base_url":     None,
         "api_key":      os.getenv("OPENAI_API_KEY", ""),
-        "model":        "gpt-4o",
+        "model":        "gpt-4.1",
         "max_snapshot": 16_000,
     },
 }
@@ -53,9 +53,12 @@ Core rules:
 - When writing browser_run_code, write Python async Playwright code. `page` and `context` are available. Use `await` for all calls.
 - Never call browser_navigate or browser_click more than once per turn. These change page state — parallel calls conflict. One action per step, then snapshot.
 - If you get "not in snapshot" on a click, take a fresh snapshot immediately — do NOT retry the same index.
-- Never navigate to a brand homepage (e.g. stevemadden.com, nike.com). Stay on aggregator/category pages like Zappos or Amazon where products are directly listed and clickable.
-- If a popup or modal appears, close it first before doing anything else — look for a close/dismiss button in the snapshot and click it.
-- Never construct or guess a URL from memory. Only navigate to URLs that are visible in the current page snapshot or search results."""
+- If a site requires login or blocks access, move on to a different site instead of getting stuck.
+- If a popup or modal appears, first try pressing Escape (browser_press_key with key "Escape") — this closes most overlays instantly without needing a snapshot. Only try clicking a close button if Escape didn't work.
+- If a snapshot returns almost no elements (just URL and title), the page is probably blocked by a popup — press Escape, wait, then snapshot again.
+- Never construct or guess a URL from memory. Only navigate to URLs that are visible in the current page snapshot or search results.
+- Use browser_take_screenshot when you need visual confirmation: after unexpected navigation results, when a snapshot looks wrong or empty, when you cannot find elements you expect, or when the task involves identifying the appearance or look of a product (e.g. color, style, packaging, images shown on the page). Do not take screenshots after every action — only when the visual content matters for the task or something seems off.
+- Call emit_product_card only when a product genuinely fits what the user is looking for — use your judgment based on the full context of the conversation (style, vibe, budget, occasion, etc.). Do not emit every product you visit. If a product doesn't match well, skip it and keep looking. When you do emit, choose detail_label and detail_value based on what matters most for this specific request, and write a justification that explains exactly why this one fits."""
 
 ASK_HUMAN_TOOL = {
     "type": "function",
@@ -76,33 +79,54 @@ ASK_HUMAN_TOOL = {
     },
 }
 
+EMIT_CARD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "emit_product_card",
+        "description": (
+            "Emit a product card to the UI as soon as you have confirmed a product's details. "
+            "Call this once per product, right after visiting its page — do not batch at the end."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "store":         {"type": "string", "description": "Retailer name (e.g. Amazon, Zappos)"},
+                "name":          {"type": "string", "description": "Full product name"},
+                "price":         {"type": "string", "description": "Price as shown on the page (e.g. $49.99)"},
+                "url":           {"type": "string", "description": "Direct URL to this product page"},
+                "detail_label":  {"type": "string", "description": "Label for the key extra detail (e.g. Color, Quantity, Rating)"},
+                "detail_value":  {"type": "string", "description": "Value for that detail (e.g. Pastel Mint, 8 lb, 4.5 stars)"},
+                "justification": {"type": "string", "description": "One sentence explaining why this product fits the user's request"},
+            },
+            "required": ["store", "name", "price", "url", "detail_label", "detail_value", "justification"],
+        },
+    },
+}
+
 # ── Modes ─────────────────────────────────────────────────────────────────────
 
 TASK_MODES: dict[str, dict] = {
     "shopping": {
         "description": "User wants to find, compare, or buy products - prices, deals, recommendations.",
         "prompt": """
-SHOPPING MODE — follow these steps exactly:
+SHOPPING MODE:
 
-STEP 0 — before doing anything, decide what columns to track based on the goal:
-- Price comparison goal → columns: Store | Product | Price | Availability
-- Style/aesthetic goal → columns: Store | Product | Description | Style notes | Price
-- Feature comparison goal → columns: Store | Product | Key specs | Price | Rating
-Output the empty table with headers immediately so you know what to fill in.
+STEP 0 — Ask the user 1-2 clarifying questions using ask_human before doing anything. Understand their style, vibe, budget, occasion, or any preference that would help you find the right thing. Do not start browsing until you have their answers.
 
-STEP 1 — Search for the item. Use Google Shopping or go directly to Amazon/Zappos/eBay.
-STEP 2 — From the search results, click a product link directly (do not construct URLs from memory).
-STEP 3 — On the product page: scroll down to see full price, availability, and details.
-STEP 4 — Add a row to your comparison table with what you found on this store.
-STEP 5 — Navigate back and repeat for the next store. Visit at least 3 different stores.
-STEP 6 — After 3+ stores, use the completed table to write your final recommendation.
+STEP 1 — Research first. Search the web to understand what's trending, well-reviewed, or relevant to the request. Read articles, reviews, or forum discussions to build context. Decide what to look for based on what you learn — not from assumptions.
+
+STEP 2 — Based on your research, search for specific products. Decide organically which sites to visit based on what makes sense for the request (e.g. niche boutiques, department stores, resale markets, brand sites — whatever fits).
+
+STEP 3 — Click into individual product pages. Use your judgment: does this product genuinely fit what the user described? If yes, emit a card. If not, skip it and keep looking.
+
+STEP 4 — Find and emit at least 3 products that truly match, then write a final summary.
 
 Rules:
 - Never construct or guess a URL. Only navigate to URLs visible in the current snapshot or search results.
-- Never open new tabs. Visit stores one at a time in the same tab, use browser_back to return.
-- A search results page is NOT a product page — click through to the actual item.
-- Update the comparison table after EVERY store visit, not at the end.""",
-        "judge_extra": "STRICT CHECK: The agent must have visited at least 3 individual product pages on distinct retailer sites (not google.com, not search result pages). The final answer must include a comparison table with real prices/details found by actually visiting each page.",
+- Never open new tabs. One tab, use browser_back to navigate.
+- Search results pages are not product pages — click through to the actual item.
+- Only emit cards for products that genuinely fit — be selective.""",
+        "judge_extra": "The agent must have asked clarifying questions, done research before shopping, and visited individual product pages on sites it chose organically. Cards should only be for products that fit the user's stated preferences.",
     },
     "research": {
         "description": "User wants to learn, investigate, or understand a topic.",
@@ -127,6 +151,8 @@ class AgentState:
     judge_rounds: int = 0
     summary_cache: dict = field(default_factory=dict)
     tool_outputs: dict = field(default_factory=dict)  # new tools drop structured output here
+    emitted_urls: set = field(default_factory=set)
+    ask_human_count: int = 0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -160,6 +186,11 @@ class BrowserAgent:
         self.mode: str | None = None
         self.state = AgentState(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
 
+        # Optional callbacks set by the web server — None in CLI mode
+        self.on_card: callable | None = None           # async fn(card: dict)
+        self.on_thinking: callable | None = None       # async fn(text: str)
+        self.on_ask_human: callable | None = None      # async fn(question: str) -> str
+
         print(f"[Agent] Backend: {b} | Model: {self.model} | Browser: {browser}")
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -167,8 +198,8 @@ class BrowserAgent:
     async def connect(self):
         await self.browser.connect()
         browser_tools  = await self.browser.get_tools()
-        self.tools     = browser_tools + [ASK_HUMAN_TOOL]
-        print(f"[Agent] Ready — {len(browser_tools)} browser tools + ask_human\n")
+        self.tools     = browser_tools + [ASK_HUMAN_TOOL, EMIT_CARD_TOOL]
+        print(f"[Agent] Ready — {len(browser_tools)} browser tools + ask_human + emit_product_card\n")
 
     async def close(self):
         await self.browser.close()
@@ -259,10 +290,10 @@ class BrowserAgent:
         return groups
 
     def _build_context(self) -> list[dict]:
-        system   = [m for m in self.state.messages if m["role"] == "system"]
-        rest     = [m for m in self.state.messages if m["role"] != "system"]
+        system = [m for m in self.state.messages if m["role"] == "system"]
+        rest   = [m for m in self.state.messages if m["role"] != "system"]
 
-        groups   = self._group_messages(rest)
+        groups = self._group_messages(rest)
 
         # Pin first user message, trim from the middle by dropping oldest pairs
         pinned    = groups[:1] if groups else []
@@ -276,29 +307,43 @@ class BrowserAgent:
 
         kept = pinned + trimmable
 
-        # Summarize tool results in older pairs, keep last TOOL_RESULT_KEEP_FULL pairs full
+        # Snapshots: only the most recent browser_snapshot result stays full.
+        # All earlier ones are summarized immediately — stale DOM trees are pure bloat.
+        snapshot_groups = [
+            g for g in kept
+            if any(m["role"] == "tool" and m.get("_name") == "browser_snapshot" for m in g)
+        ]
+        stale_snapshot_ids = {id(g) for g in snapshot_groups[:-1]}
+
+        # Other tool results: summarize beyond TOOL_RESULT_KEEP_FULL
         tool_pairs = [g for g in kept if any(m["role"] == "tool" for m in g)]
-        cutoff_pairs = set(
+        cutoff_ids = {
             id(g) for g in tool_pairs[:-TOOL_RESULT_KEEP_FULL]
-        ) if len(tool_pairs) > TOOL_RESULT_KEEP_FULL else set()
+        } if len(tool_pairs) > TOOL_RESULT_KEEP_FULL else set()
+
+        summarize_ids = stale_snapshot_ids | cutoff_ids
 
         trimmed = []
         for group in kept:
-            if id(group) in cutoff_pairs:
+            if id(group) in summarize_ids:
                 summarized = []
                 for m in group:
                     if m["role"] == "tool":
                         tc_id = m.get("tool_call_id", "")
                         if tc_id not in self.state.summary_cache:
                             self.state.summary_cache[tc_id] = self._summarize_tool_result(m["content"] or "")
-                            print(f"[Summary] {self.state.summary_cache[tc_id]}")
+                            print(f"[Summary] {self.state.summary_cache[tc_id][:80]}")
                         m = {**m, "content": self.state.summary_cache[tc_id]}
                     summarized.append(m)
                 trimmed.extend(summarized)
             else:
                 trimmed.extend(group)
 
-        context = system + trimmed
+        # Strip private metadata fields (_name, _llm_time_s, _browser_time_s) before sending to LLM
+        def _strip(m: dict) -> dict:
+            return {k: v for k, v in m.items() if not k.startswith("_")}
+
+        context = [_strip(m) for m in system + trimmed]
         STATE_LOG.write_text(json.dumps(self.state.messages, indent=2))
         CONTEXT_LOG.write_text(json.dumps(context, indent=2))
         return context
@@ -337,13 +382,14 @@ class BrowserAgent:
     # ── LLM calls ─────────────────────────────────────────────────────────────
 
     def _think(self, context: list[dict]):
-        """Main LLM call — returns the raw message."""
+        """Main LLM call — returns (message, elapsed_seconds)."""
         t0       = time.time()
         response = self.llm.chat.completions.create(
             model=self.model, messages=context, tools=self.tools,
         )
-        print(f"[Time] LLM: {time.time() - t0:.1f}s")
-        return response.choices[0].message
+        elapsed = time.time() - t0
+        print(f"[Time] LLM: {elapsed:.1f}s")
+        return response.choices[0].message, elapsed
 
     def _judge(self, task: str, answer: str, judge_extra: str = "") -> tuple[bool, str]:
         visited = "\n".join(f"- {u}" for u in self.state.visited_urls) or "- (no pages visited)"
@@ -376,36 +422,20 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         except Exception:
             return True, ""
 
-    async def _check_screenshot(self, trigger: str, images: list):
-        """Send screenshot to LLM for visual confirmation, store only the text reply."""
+    async def _check_screenshot(self, images: list) -> str:
+        """Send only the screenshot to the LLM and return a one-sentence description."""
         if not images:
-            try:
-                _, images = await asyncio.wait_for(
-                    self.browser.call_tool("browser_take_screenshot", {}), timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                print("[Screenshot] timed out — skipping")
-                return
-        if not images:
-            return
-
-        print(f"[Screenshot] auto after {trigger}")
-        self._heal_messages()
-        context = self._build_context()
-        context.append({"role": "user", "content": [
-            {"type": "text", "text": "Screenshot taken after last action. Reply in one sentence describing what page you are on. Do not call any tools. Plain text only."},
-            *images,
-        ]})
+            return "[screenshot unavailable]"
         t0 = time.time()
-        # No tools passed — prevents model from outputting tool call syntax
-        response = self.llm.chat.completions.create(model=self.model, messages=context)
-        print(f"[Time] LLM (screenshot check): {time.time() - t0:.1f}s")
-        confirmation = response.choices[0].message.content or ""
-        # If model still output tool call syntax, replace with a neutral placeholder
-        if not confirmation or confirmation.strip().startswith("call:") or "tool_call" in confirmation:
-            confirmation = f"[page confirmed after {trigger}]"
-        print(f"[Screenshot] {confirmation[:120]}")
-        self.state.messages.append({"role": "user", "content": f"[Visual check after {trigger}]: {confirmation}"})
+        response = self.llm.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "Describe this webpage in one sentence: what site is this and what is shown on screen?"},
+                *images,
+            ]}],
+        )
+        print(f"[Time] LLM (screenshot): {time.time() - t0:.1f}s")
+        return response.choices[0].message.content or "[could not describe screenshot]"
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
@@ -421,13 +451,45 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         if name in ("navigate_page", "new_page") and "url" in args:
             self._track_url(args["url"])
 
-        # ask_human is handled locally — always a single call, safe to append directly
+        # ask_human — cap at 2 questions, then route to web UI or terminal
         if name == "ask_human":
-            print(f"\n[Agent asks] {args.get('question', '')}")
-            human_response = input("Your answer: ").strip()
-            print()
-            self.state.messages.append({"role": "tool", "tool_call_id": tc.id, "content": human_response})
-            return None
+            if self.state.ask_human_count >= 2:
+                print(f"[ask_human] Cap reached — skipping question")
+                return {"role": "tool", "tool_call_id": tc.id, "content": "You have asked enough clarifying questions. Proceed with what you know.", "_name": "ask_human", "_browser_time_s": 0}
+            self.state.ask_human_count += 1
+            question = args.get("question", "")
+            print(f"\n[Agent asks] {question}")
+            if self.on_ask_human:
+                human_response = await self.on_ask_human(question)
+            else:
+                human_response = input("Your answer: ").strip()
+            print(f"[Human] {human_response}")
+            return {"role": "tool", "tool_call_id": tc.id, "content": human_response, "_name": "ask_human", "_browser_time_s": 0}
+
+        # emit_product_card — grab og:image from current page, fire callback, log to console
+        if name == "emit_product_card":
+            url = args.get("url", "")
+            if url and url in self.state.emitted_urls:
+                print(f"[Card] Duplicate skipped: {url}")
+                return {"role": "tool", "tool_call_id": tc.id, "content": "Already emitted a card for this product. Navigate to a completely different store or product page.", "_name": "emit_product_card", "_browser_time_s": 0}
+            if url:
+                self.state.emitted_urls.add(url)
+            image_url = await self.browser.get_og_image()
+            card = {
+                "store":         args.get("store", ""),
+                "name":          args.get("name", ""),
+                "price":         args.get("price", ""),
+                "url":           url,
+                "detail_label":  args.get("detail_label", ""),
+                "detail_value":  args.get("detail_value", ""),
+                "justification": args.get("justification", ""),
+                "image_url":     image_url,
+            }
+            print(f"[Card] {card['store']} — {card['name']} — {card['price']} | {card['detail_label']}: {card['detail_value']}")
+            print(f"       {card['justification']}")
+            if self.on_card:
+                await self.on_card(card)
+            return {"role": "tool", "tool_call_id": tc.id, "content": "Card emitted. Now navigate to a different store or product to find more options.", "_name": "emit_product_card", "_browser_time_s": 0}
 
         # Log browser_run_code to file instead of console
         if name == "browser_run_code":
@@ -438,6 +500,21 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         else:
             print(f"[Tool] {name}({args})")
 
+        # Emit thinking event for the web UI
+        if self.on_thinking:
+            thinking_text = {
+                "browser_navigate":        f"Navigating to {args.get('url', '')}",
+                "browser_snapshot":        "Reading page content",
+                "browser_click":           f"Clicking: {args.get('element') or 'index ' + str(args.get('index', ''))}",
+                "browser_type":            f"Typing: {args.get('text', '')}",
+                "browser_scroll":          f"Scrolling {args.get('direction', 'down')}",
+                "browser_press_key":       f"Pressing {args.get('key', '')}",
+                "browser_take_screenshot": "Taking screenshot",
+                "browser_back":            "Going back",
+                "browser_forward":         "Going forward",
+            }.get(name, name)
+            await self.on_thinking(thinking_text)
+
         # Execute against browser
         t0 = time.time()
         try:
@@ -445,6 +522,11 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         except asyncio.TimeoutError:
             text, images = "[Tool timed out after 15s]", []
         print(f"[Time] Browser ({self._browser_type}): {time.time() - t0:.1f}s")
+
+        # For screenshots: summarise the image and return text only — keeps images out of context
+        if name == "browser_take_screenshot" and images:
+            text = await self._check_screenshot(images)
+            images = []
 
         # Truncate large snapshots
         raw_len = len(text)
@@ -473,7 +555,7 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
                 self.state.evidence.append({"url": current_url, "screenshot": path})
                 print(f"[Evidence] screenshot saved: {path}")
 
-        return {"role": "tool", "tool_call_id": tc.id, "content": text, "_images": images, "_name": name}
+        return {"role": "tool", "tool_call_id": tc.id, "content": text, "_images": images, "_name": name, "_browser_time_s": round(time.time() - t0, 2)}
 
     # ── Core loop ─────────────────────────────────────────────────────────────
 
@@ -485,6 +567,8 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         self.state.evidence = []
         self.state.judge_rounds = 0
         self.state.tool_outputs = {}
+        self.state.emitted_urls = set()
+        self.state.ask_human_count = 0
         self._heal_messages()
         self.state.messages.append({"role": "user", "content": task})
 
@@ -495,11 +579,11 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
             context = self._build_context()
             print(f"[Context] {len(context)} messages | ~{_count_tokens(context):,} tokens")
 
-            message = self._think(context)
+            message, llm_time = self._think(context)
 
             # ── No tool calls: agent proposes an answer ──
             if not message.tool_calls:
-                self.state.messages.append({"role": "assistant", "content": message.content})
+                self.state.messages.append({"role": "assistant", "content": message.content, "_llm_time_s": round(llm_time, 2)})
                 print(f"\n[Agent] Proposed answer after {step + 1} step(s)")
 
                 if self.state.judge_rounds < MAX_JUDGE_ROUNDS:
@@ -520,6 +604,7 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
                     {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in message.tool_calls
                 ],
+                "_llm_time_s": round(llm_time, 2),
             }
 
             results = []
@@ -531,11 +616,12 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
             # Commit assistant message + all results together — never a partial pair
             self.state.messages.append(assistant_msg)
             for r in results:
-                self.state.messages.append({"role": "tool", "tool_call_id": r["tool_call_id"], "content": r["content"]})
-
-            # Run screenshot checks after the pair is committed
-            for r in results:
-                if r["_images"] or r["_name"] in ("browser_navigate", "browser_click"):
-                    await self._check_screenshot(r["_name"], r["_images"])
+                self.state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": r["tool_call_id"],
+                    "content": r["content"],
+                    "_name": r.get("_name", ""),
+                    "_browser_time_s": r.get("_browser_time_s", 0),
+                })
 
         return "Reached max steps without completing the task."

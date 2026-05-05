@@ -245,6 +245,15 @@ class CDPBrowserClient:
             return f"[Tool not implemented: {name}]", []
         return await handler(args)
 
+    async def get_og_image(self) -> str:
+        """Return the og:image URL from the current page, or empty string if not found."""
+        try:
+            return await self._page.evaluate(
+                "document.querySelector('meta[property=\"og:image\"]')?.content || ''"
+            )
+        except Exception:
+            return ""
+
     async def close(self):
         if self._cdp:
             try:
@@ -303,7 +312,7 @@ class CDPBrowserClient:
         result = await self._cdp.send("Runtime.callFunctionOn", {
             "objectId": obj_id,
             "functionDeclaration": """function() {
-                this.scrollIntoView({block: 'center', inline: 'center', behavior: 'smooth'});
+                this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
                 const r = this.getBoundingClientRect();
                 return {x: r.left + r.width / 2, y: r.top + r.height / 2};
             }""",
@@ -377,6 +386,7 @@ class CDPBrowserClient:
             print(f"[cursor] hover failed for index {index}: {e}")
 
     async def _cdp_click(self, x: float, y: float):
+        print(f"[mouse] click at ({x:.0f}, {y:.0f})")
         for event_type in ("mousePressed", "mouseReleased"):
             await self._cdp.send("Input.dispatchMouseEvent", {
                 "type": event_type,
@@ -418,7 +428,7 @@ class CDPBrowserClient:
                 await self._ensure_cursor()
                 await self._move_cursor(x, y)
                 print(f"[cursor] → index {index} at ({x:.0f}, {y:.0f})")
-                await self._page.wait_for_timeout(700)  # pause so you can see what it's about to click
+                await self._page.wait_for_timeout(1400)  # pause so you can see what it's about to click
 
             await self._cdp_click(x, y)
             await self._page.wait_for_timeout(600)
@@ -448,14 +458,19 @@ class CDPBrowserClient:
             return f"[Type failed: index {index} not in snapshot — take a fresh snapshot first]\n{state}", []
 
         try:
-            # Click to focus via real mouse event, then type
             x, y = await self._get_element_center(index)
+            print(f"[mouse] type target index {index} at ({x:.0f}, {y:.0f}) — text: {text!r}")
+            if self.visible_mouse:
+                await self._ensure_cursor()
+                await self._move_cursor(x, y)
+                await self._page.wait_for_timeout(400)
             await self._cdp_click(x, y)
             await self._page.wait_for_timeout(100)
             await self._page.keyboard.type(text)
             state = await self._page_state()
             return state, []
         except Exception as e:
+            print(f"[mouse] type failed at index {index}: {e}")
             state = await self._page_state()
             return f"[Type failed: {e}]\n{state}", []
 
