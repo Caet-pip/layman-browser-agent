@@ -1,4 +1,4 @@
-# layman-browser-agent
+# browser-agent
 
 > Early-stage project, very much a work in progress.
 
