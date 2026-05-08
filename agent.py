@@ -33,6 +33,7 @@ MAX_JUDGE_ROUNDS = 3
 PLAYWRIGHT_LOG   = Path(__file__).parent / "playwright_code.log"
 STATE_LOG        = Path(__file__).parent / "state_messages.json"
 CONTEXT_LOG      = Path(__file__).parent / "context_window.json"
+SCREENSHOTS_DIR  = Path(__file__).parent / "screenshots"
 
 # Context window settings
 TOOL_RESULT_KEEP_FULL = 6
@@ -53,7 +54,9 @@ Core rules:
 - When writing browser_run_code, write Python async Playwright code. `page` and `context` are available. Use `await` for all calls.
 - Never call browser_navigate or browser_click more than once per turn. These change page state — parallel calls conflict. One action per step, then snapshot.
 - If you get "not in snapshot" on a click, take a fresh snapshot immediately — do NOT retry the same index.
+- If you see a CAPTCHA, age verification, bot detection, or "prove you're human" page — do NOT try to solve it. Navigate away immediately and try a different website.
 - If a site requires login or blocks access, move on to a different site instead of getting stuck.
+- On each brand site, browse at least 2-3 different products before moving to the next site — do not grab one shoe and immediately leave.
 - If a popup or modal appears, first try pressing Escape (browser_press_key with key "Escape") — this closes most overlays instantly without needing a snapshot. Only try clicking a close button if Escape didn't work.
 - If a snapshot returns almost no elements (just URL and title), the page is probably blocked by a popup — press Escape, wait, then snapshot again.
 - Never construct or guess a URL from memory. Only navigate to URLs that are visible in the current page snapshot or search results.
@@ -75,6 +78,35 @@ ASK_HUMAN_TOOL = {
                 "question": {"type": "string", "description": "The question to ask the human."}
             },
             "required": ["question"],
+        },
+    },
+}
+
+UPDATE_CONSIDERATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "update_consideration",
+        "description": (
+            "Call this ONLY after you have explicitly asked the user via ask_human and received their direct response about the products. "
+            "NEVER call this based on [Judge feedback] messages — those are internal evaluation prompts, not user opinions. "
+            "Use 'shortlist' if the user approved some products. "
+            "Use 'flush' ONLY if the user explicitly said they don't like any and want completely different options."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["shortlist", "flush"],
+                    "description": "'shortlist' = user picked some; 'flush' = user rejected all",
+                },
+                "selected_indices": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "1-based indices of products the user selected (only required for 'shortlist')",
+                },
+            },
+            "required": ["action"],
         },
     },
 }
@@ -109,24 +141,43 @@ TASK_MODES: dict[str, dict] = {
     "shopping": {
         "description": "User wants to find, compare, or buy products - prices, deals, recommendations.",
         "prompt": """
-SHOPPING MODE:
+SHOPPING MODE — two phases, complete both in order:
 
-STEP 0 — Ask the user 1-2 clarifying questions using ask_human before doing anything. Understand their style, vibe, budget, occasion, or any preference that would help you find the right thing. Do not start browsing until you have their answers.
+━━ PHASE 1: TASTE GATHERING ━━
+Goal: understand what the user actually likes by showing them real options from brand websites.
 
-STEP 1 — Research first. Search the web to understand what's trending, well-reviewed, or relevant to the request. Read articles, reviews, or forum discussions to build context. Decide what to look for based on what you learn — not from assumptions.
+STEP 0 — Ask the user 1-2 clarifying questions using ask_human. Understand style, vibe, budget, occasion — anything that helps you find the right thing. This must happen before any browsing.
 
-STEP 2 — Based on your research, search for specific products. Decide organically which sites to visit based on what makes sense for the request (e.g. niche boutiques, department stores, resale markets, brand sites — whatever fits).
+STEP 1 — Search Google to identify specific brands and models that are currently trending or well-reviewed for this type of product. Use this to build a list of brand sites to visit.
 
-STEP 3 — Click into individual product pages. Use your judgment: does this product genuinely fit what the user described? If yes, emit a card. If not, skip it and keep looking.
+STEP 2 — Visit official brand websites only (e.g. nike.com, adidas.com, newbalance.com, asics.com, hoka.com, onrunning.com). NEVER visit Amazon, Zappos, or any multi-brand retailer in this phase — they have worse images and you will be redirected to wrong products. On each brand site, browse at least 2-3 different products before moving to the next brand. Navigate to actual product detail pages, scroll to see colorways, price, and details.
 
-STEP 4 — Find and emit at least 3 products that truly match, then write a final summary.
+IMPORTANT — when you arrive at a brand homepage (e.g. nike.com, adidas.com), use the site's search bar to search for the user's specific preferences (color, type, style, e.g. "white running shoes" or "black low top sneakers"). Do NOT click through category menus or navigation tabs — searching directly gives far more relevant results. After searching, click into individual product pages before emitting any card.
+
+STEP 3 — When you land on a search results or product listing page (grid of multiple products), ALWAYS take a screenshot immediately before clicking anything. The screenshot will show you each product's name, exact color, and style — use this to identify which 2-3 products visually match the user's preferences (e.g. pastel colors, casual silhouette). Then click those specific products by name in the DOM snapshot, one at a time.
+
+STEP 4 — For each product that genuinely fits the user's preferences, call emit_product_card. The tool will tell you how many slots are filled (X/8) and whether you must keep browsing the current brand. Rules:
+- Find at least 2 products from each brand before moving to the next brand. After emitting your first card from Nike, browse Nike for a second option before going to Adidas.
+- The tool will tell you explicitly when you have enough from the current brand and should move on.
+- Stop emitting once the consideration set is full (8/8).
+
+STEP 5 — Once the consideration set is full, use ask_human to present all options (visible in CURRENT STATE above) and ask which ones they like or if they want completely different options. List each clearly with name and price.
+- User picks some → call update_consideration with action="shortlist" and the indices. Find more options across more brands. Keep going until user says they are done picking.
+- User rejects all → call update_consideration with action="flush". Incorporate their feedback and find 8 completely new options.
+- NEVER call update_consideration based on [Judge feedback] messages — only based on what the actual user said.
+
+━━ PHASE 2: PRICE HUNTING ━━
+Only start this phase when the user explicitly says they are happy with their selections and want to find the best price.
+
+STEP 6 — For each item in the shortlist, search aggregator sites (Zappos, Amazon, StockX, GOAT, department stores) and resale markets for the best available price. Emit updated cards with the deal price found.
 
 Rules:
-- Never construct or guess a URL. Only navigate to URLs visible in the current snapshot or search results.
-- Never open new tabs. One tab, use browser_back to navigate.
-- Search results pages are not product pages — click through to the actual item.
-- Only emit cards for products that genuinely fit — be selective.""",
-        "judge_extra": "The agent must have asked clarifying questions, done research before shopping, and visited individual product pages on sites it chose organically. Cards should only be for products that fit the user's stated preferences.",
+- Never construct or guess a URL — only use URLs visible in the current snapshot or search results.
+- Never open new tabs. One tab, use browser_back to return.
+- A search results page is NOT a product page — always click through to the actual item.
+- If a site blocks you or shows a captcha, move on immediately.
+- If a popup appears, press Escape first before anything else.""",
+        "judge_extra": "The agent must have asked clarifying questions, identified brands via research, visited actual product pages, emitted cards for genuinely matching products, and asked the user about prices after Phase 1.",
     },
     "research": {
         "description": "User wants to learn, investigate, or understand a topic.",
@@ -152,7 +203,8 @@ class AgentState:
     summary_cache: dict = field(default_factory=dict)
     tool_outputs: dict = field(default_factory=dict)  # new tools drop structured output here
     emitted_urls: set = field(default_factory=set)
-    ask_human_count: int = 0
+    consideration_set: list[dict] = field(default_factory=list)  # up to 4 current options shown to user
+    shortlist: list[dict] = field(default_factory=list)           # user-approved items for Phase 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -190,6 +242,7 @@ class BrowserAgent:
         self.on_card: callable | None = None           # async fn(card: dict)
         self.on_thinking: callable | None = None       # async fn(text: str)
         self.on_ask_human: callable | None = None      # async fn(question: str) -> str
+        self.on_event: callable | None = None          # async fn(event: dict) — generic UI events
 
         print(f"[Agent] Backend: {b} | Model: {self.model} | Browser: {browser}")
 
@@ -198,8 +251,8 @@ class BrowserAgent:
     async def connect(self):
         await self.browser.connect()
         browser_tools  = await self.browser.get_tools()
-        self.tools     = browser_tools + [ASK_HUMAN_TOOL, EMIT_CARD_TOOL]
-        print(f"[Agent] Ready — {len(browser_tools)} browser tools + ask_human + emit_product_card\n")
+        self.tools     = browser_tools + [ASK_HUMAN_TOOL, EMIT_CARD_TOOL, UPDATE_CONSIDERATION_TOOL]
+        print(f"[Agent] Ready — {len(browser_tools)} browser tools + ask_human + emit_product_card + update_consideration\n")
 
     async def close(self):
         await self.browser.close()
@@ -291,6 +344,20 @@ class BrowserAgent:
 
     def _build_context(self) -> list[dict]:
         system = [m for m in self.state.messages if m["role"] == "system"]
+
+        # Append live consideration set to system prompt so LLM always knows what's on the table
+        if self.state.consideration_set or self.state.shortlist:
+            lines = ["", "── CURRENT STATE ──"]
+            if self.state.consideration_set:
+                lines.append(f"Consideration set ({len(self.state.consideration_set)}/8 slots):")
+                for i, p in enumerate(self.state.consideration_set):
+                    lines.append(f"  {i+1}. {p['name']} — {p['price']} ({p['store']})")
+            if self.state.shortlist:
+                lines.append("Shortlist (user approved for price hunting):")
+                for p in self.state.shortlist:
+                    lines.append(f"  • {p['name']} — {p['store']}")
+            system = [{**system[0], "content": system[0]["content"] + "\n".join(lines)}] if system else system
+
         rest   = [m for m in self.state.messages if m["role"] != "system"]
 
         groups = self._group_messages(rest)
@@ -422,20 +489,60 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         except Exception:
             return True, ""
 
-    async def _check_screenshot(self, images: list) -> str:
-        """Send only the screenshot to the LLM and return a one-sentence description."""
+    async def _check_screenshot(self, images: list, task: str = "", step: int = 0) -> str:
+        """Send screenshot to LLM. On product listing pages, lists visible product names; otherwise one-sentence description.
+        Saves the raw PNG + description txt to screenshots/ for debugging."""
         if not images:
             return "[screenshot unavailable]"
+
         t0 = time.time()
+        if task:
+            prompt = (
+                f"A browser agent is working on: \"{task}\"\n\n"
+                "Look at this screenshot carefully.\n\n"
+                "If this is a product listing, search results, or category page showing MULTIPLE products:\n"
+                "Respond with LISTING: then for each visible product (up to 8) write one line: "
+                "'- [product name] | [color/colorway] | [style descriptor, e.g. low-top, chunky, minimal, retro]'\n"
+                "Be specific about colors — say 'pastel lavender' not just 'purple', 'off-white' not just 'white'.\n\n"
+                "If this is a single product detail page or any other page:\n"
+                "Respond with PAGE: then one sentence describing what's shown."
+            )
+        else:
+            prompt = "Describe this webpage in one sentence: what site is this and what is shown on screen?"
         response = self.llm.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": [
-                {"type": "text", "text": "Describe this webpage in one sentence: what site is this and what is shown on screen?"},
+                {"type": "text", "text": prompt},
                 *images,
             ]}],
         )
         print(f"[Time] LLM (screenshot): {time.time() - t0:.1f}s")
-        return response.choices[0].message.content or "[could not describe screenshot]"
+        description = response.choices[0].message.content or "[could not describe screenshot]"
+
+        # Save LLM description alongside the PNG
+        try:
+            txt_path = SCREENSHOTS_DIR / f"step_{step:03d}.txt"
+            txt_path.write_text(description)
+        except Exception as e:
+            print(f"[Screenshot] Failed to save txt: {e}")
+
+        return description
+
+    async def _generate_title(self, task: str) -> str:
+        """Quick LLM call to generate a fun contextual title for the UI header."""
+        try:
+            response = self.llm.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": f"Write a short, fun, enthusiastic title (max 8 words, no quotes, no leading punctuation) for this task: {task}"}],
+            )
+            return response.choices[0].message.content.strip().strip('"').strip("'")
+        except Exception:
+            return "Let's get started!"
+
+    async def _fire_title(self, task: str):
+        title = await self._generate_title(task)
+        if self.on_event:
+            await self.on_event({"type": "update_title", "text": title})
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
@@ -453,10 +560,6 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
 
         # ask_human — cap at 2 questions, then route to web UI or terminal
         if name == "ask_human":
-            if self.state.ask_human_count >= 2:
-                print(f"[ask_human] Cap reached — skipping question")
-                return {"role": "tool", "tool_call_id": tc.id, "content": "You have asked enough clarifying questions. Proceed with what you know.", "_name": "ask_human", "_browser_time_s": 0}
-            self.state.ask_human_count += 1
             question = args.get("question", "")
             print(f"\n[Agent asks] {question}")
             if self.on_ask_human:
@@ -465,6 +568,34 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
                 human_response = input("Your answer: ").strip()
             print(f"[Human] {human_response}")
             return {"role": "tool", "tool_call_id": tc.id, "content": human_response, "_name": "ask_human", "_browser_time_s": 0}
+
+        # update_consideration — flush or shortlist based on user response
+        if name == "update_consideration":
+            action = args.get("action", "flush")
+            indices = [i - 1 for i in args.get("selected_indices", [])]  # convert to 0-based
+
+            if action == "shortlist" and indices:
+                selected = [self.state.consideration_set[i] for i in indices if i < len(self.state.consideration_set)]
+                rejected = [p for i, p in enumerate(self.state.consideration_set) if i not in indices]
+                self.state.shortlist.extend(selected)
+                keep_urls = [p["url"] for p in selected]
+                names = ", ".join(p["name"] for p in selected)
+                print(f"[Consideration] Shortlisted: {names}")
+                # Tell UI to remove the rejected cards
+                if self.on_event:
+                    await self.on_event({"type": "keep_cards", "urls": keep_urls})
+                    await self.on_event({"type": "update_title", "text": "Let me find more options!"})
+                self.state.consideration_set = []
+                self.state.emitted_urls = set()  # allow finding fresh products
+                return {"role": "tool", "tool_call_id": tc.id, "content": f"Shortlisted: {names}. Shortlist now has {len(self.state.shortlist)} item(s). Consideration set cleared. Find 4 more products across different brand sites (2 per brand minimum) to show the user — do NOT start price hunting yet unless the user explicitly asked for it.", "_name": "update_consideration", "_browser_time_s": 0}
+            else:
+                print(f"[Consideration] Flushed — starting new round")
+                if self.on_event:
+                    await self.on_event({"type": "keep_cards", "urls": []})
+                    await self.on_event({"type": "update_title", "text": "Let me try something different!"})
+                self.state.consideration_set = []
+                self.state.emitted_urls = set()
+                return {"role": "tool", "tool_call_id": tc.id, "content": "All rejected. Cards cleared. Incorporate the user's feedback and find 8 completely new options across different brands (2 per brand minimum).", "_name": "update_consideration", "_browser_time_s": 0}
 
         # emit_product_card — grab og:image from current page, fire callback, log to console
         if name == "emit_product_card":
@@ -489,7 +620,24 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
             print(f"       {card['justification']}")
             if self.on_card:
                 await self.on_card(card)
-            return {"role": "tool", "tool_call_id": tc.id, "content": "Card emitted. Now navigate to a different store or product to find more options.", "_name": "emit_product_card", "_browser_time_s": 0}
+
+            # Add to consideration set
+            self.state.consideration_set.append({"name": card["name"], "store": card["store"], "price": card["price"], "url": card["url"]})
+            count = len(self.state.consideration_set)
+            same_brand_count = sum(1 for p in self.state.consideration_set if p["store"] == card["store"])
+            print(f"[Consideration] {count}/8 slots filled | {card['store']}: {same_brand_count} product(s)")
+
+            if count == 1 and self.on_event:
+                await self.on_event({"type": "update_title", "text": "How do these look?"})
+
+            if count < 8:
+                if same_brand_count < 2:
+                    return {"role": "tool", "tool_call_id": tc.id, "content": f"Card emitted ({count}/8). You only have {same_brand_count} product from {card['store']} — stay on this brand and find at least one more option here before moving to the next brand.", "_name": "emit_product_card", "_browser_time_s": 0}
+                else:
+                    return {"role": "tool", "tool_call_id": tc.id, "content": f"Card emitted ({count}/8). Good — {same_brand_count} products from {card['store']}. Now move to the next brand site and repeat (2+ products per brand).", "_name": "emit_product_card", "_browser_time_s": 0}
+            else:
+                names = ", ".join(f"{i+1}. {p['name']} ({p['price']})" for i, p in enumerate(self.state.consideration_set))
+                return {"role": "tool", "tool_call_id": tc.id, "content": f"Consideration set full (8/8). Use ask_human to present all options and get feedback: {names}", "_name": "emit_product_card", "_browser_time_s": 0}
 
         # Log browser_run_code to file instead of console
         if name == "browser_run_code":
@@ -523,9 +671,22 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
             text, images = "[Tool timed out after 15s]", []
         print(f"[Time] Browser ({self._browser_type}): {time.time() - t0:.1f}s")
 
-        # For screenshots: summarise the image and return text only — keeps images out of context
+        # For screenshots: save PNG to disk, summarise via LLM, return text only
         if name == "browser_take_screenshot" and images:
-            text = await self._check_screenshot(images)
+            # Save raw PNG immediately before anything else touches the image data
+            try:
+                import base64 as _b64
+                img_data = images[0].get("image_url", {}).get("url", "")
+                if img_data.startswith("data:image/png;base64,"):
+                    png_bytes = _b64.b64decode(img_data.split(",", 1)[1])
+                    png_path = SCREENSHOTS_DIR / f"step_{self._current_step:03d}.png"
+                    png_path.write_bytes(png_bytes)
+                    print(f"[Screenshot] Saved {png_path.name} ({len(png_bytes):,} bytes)")
+                else:
+                    print(f"[Screenshot] Unexpected format: {img_data[:60]!r}")
+            except Exception as e:
+                print(f"[Screenshot] Save failed: {type(e).__name__}: {e}")
+            text = await self._check_screenshot(images, task=task, step=self._current_step)
             images = []
 
         # Truncate large snapshots
@@ -568,13 +729,28 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
         self.state.judge_rounds = 0
         self.state.tool_outputs = {}
         self.state.emitted_urls = set()
-        self.state.ask_human_count = 0
+        self.state.consideration_set = []
+        self.state.shortlist = []
         self._heal_messages()
         self.state.messages.append({"role": "user", "content": task})
 
+        # Fire a fun contextual title for the UI — runs in background, doesn't block the loop
+        if self.on_event:
+            asyncio.create_task(self._fire_title(task))
+
         judge_extra = TASK_MODES.get(self.mode, {}).get("judge_extra", "") if self.mode else ""
 
+        _last_snapshot_fp = ""   # fingerprint of last snapshot content
+        _same_snapshot_count = 0
+
+        # Clear screenshots dir for this run
+        if SCREENSHOTS_DIR.exists():
+            for f in SCREENSHOTS_DIR.glob("step_*"):
+                f.unlink()
+        SCREENSHOTS_DIR.mkdir(exist_ok=True)
+
         for step in range(MAX_STEPS):
+            self._current_step = step
             self._heal_messages()
             context = self._build_context()
             print(f"[Context] {len(context)} messages | ~{_count_tokens(context):,} tokens")
@@ -590,7 +766,7 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
                     sufficient, feedback = self._judge(task, message.content, judge_extra)
                     self.state.judge_rounds += 1
                     if not sufficient:
-                        self.state.messages.append({"role": "user", "content": f"[Judge feedback] {feedback} Please continue researching."})
+                        self.state.messages.append({"role": "user", "content": f"[Judge feedback — internal only, NOT from the user] {feedback} Continue researching. Do NOT call update_consideration or flush the consideration set based on this message — only the user can approve or reject products."})
                         continue
 
                 print(f"[Agent] Done (judge rounds: {self.state.judge_rounds})")
@@ -623,5 +799,28 @@ Be strict. Vague or generic answers without specific details are NOT sufficient.
                     "_name": r.get("_name", ""),
                     "_browser_time_s": r.get("_browser_time_s", 0),
                 })
+
+            # Stuck detector — fires only when the exact same snapshot DOM appears repeatedly.
+            # A different product page, a search results page, even a scroll produces a different
+            # fingerprint and resets the counter. Only a truly frozen/blocked page repeats identically.
+            snapshot_results = [r for r in results if r.get("_name") == "browser_snapshot"]
+            for snap in snapshot_results:
+                content = snap.get("content", "")
+                fp = content[:500]          # URL + title + first handful of elements
+                element_count = content.count("\n[")
+                is_blank = element_count < 4
+
+                if fp and fp == _last_snapshot_fp:
+                    _same_snapshot_count += 1
+                    threshold = 3 if is_blank else 8   # exit blank pages faster
+                    print(f"[Stuck] Identical snapshot x{_same_snapshot_count} (blank={is_blank})")
+                    if _same_snapshot_count >= threshold:
+                        print(f"[Stuck] Nudging away after {_same_snapshot_count} identical snapshots")
+                        self.state.messages.append({"role": "user", "content": "[System] The page hasn't changed across multiple attempts — it is likely blocked or frozen. Navigate away immediately and try a completely different website."})
+                        _same_snapshot_count = 0
+                        _last_snapshot_fp = ""
+                else:
+                    _same_snapshot_count = 0
+                    _last_snapshot_fp = fp
 
         return "Reached max steps without completing the task."

@@ -93,9 +93,13 @@ async def _run_task(task: str, websocket: WebSocket, answer_queue: asyncio.Queue
         await websocket.send_json({"type": "ask_human", "question": question})
         return await answer_queue.get()
 
+    async def send_event(event: dict):
+        await websocket.send_json(event)
+
     agent.on_card = send_card
     agent.on_thinking = send_thinking
     agent.on_ask_human = ask_human
+    agent.on_event = send_event
 
     # Detect mode and set it
     if agent.is_continuation(task):
@@ -115,6 +119,7 @@ async def _run_task(task: str, websocket: WebSocket, answer_queue: asyncio.Queue
         agent.on_card = None
         agent.on_thinking = None
         agent.on_ask_human = None
+        agent.on_event = None
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────

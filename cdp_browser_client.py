@@ -353,9 +353,11 @@ class CDPBrowserClient:
                             </feMerge>
                         </filter>
                     </defs>
-                    <path d="M 2 2 L 2 18 L 6 14 L 10 22 L 13 20.5 L 9 12.5 L 15 12.5 Z"
-                          fill="url(#ag)" stroke="white" stroke-width="1.2"
+                    <path d="M 3 2.5 L 3 20.5 L 19 11.5 Z"
+                          fill="url(#ag)"
+                          stroke="white" stroke-width="3.5"
                           stroke-linejoin="round" stroke-linecap="round"
+                          paint-order="stroke fill"
                           filter="url(#glow)"/>
                 </svg>`;
             document.body.appendChild(el);
