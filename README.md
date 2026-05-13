@@ -108,7 +108,7 @@ python main.py --backend ollama --model llama3.2
 |------|--------|---------|-------------|
 | `--backend` | `openai`, `ollama` | `ollama` | LLM backend |
 | `--model` | any model name | backend default | Override model |
-| `--browser` | `cdp`, `direct` | `cdp` | Browser client |
+| `--browser` | `cdp` | `cdp` | Browser client |
 | `--visible-mouse` | flag | off | Show cursor during clicks |
 | `--port` | number | `8000` | Server port (web UI only) |
 
@@ -122,8 +122,6 @@ cdp_browser_client.py     — CDP browser client (snapshot, click, type, scroll,
 server.py                 — FastAPI WebSocket server for the web UI
 static/index.html         — web UI (frosted glass, floating product cards)
 main.py                   — CLI entry point
-mcp_client.py             — alternative MCP-based browser client
-direct_browser_client.py  — alternative Playwright-based browser client
 ```
 
 ---
