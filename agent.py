@@ -7,8 +7,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from openai import OpenAI
-from mcp_client import BrowserMCPClient  # wraps both @playwright/mcp and chrome-devtools-mcp
-from direct_browser_client import DirectBrowserClient
 from cdp_browser_client import CDPBrowserClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -216,7 +214,7 @@ def _count_tokens(messages: list[dict]) -> int:
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 class BrowserAgent:
-    def __init__(self, backend: str | None = None, model: str | None = None, browser: str = "direct", visible_mouse: bool = False):
+    def __init__(self, backend: str | None = None, model: str | None = None, browser: str = "cdp", visible_mouse: bool = False):
         b = backend or os.getenv("AGENT_BACKEND", "ollama")
         cfg = BACKENDS[b]
         self.model         = model or cfg["model"]
@@ -225,14 +223,7 @@ class BrowserAgent:
 
         self.llm = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
 
-        if browser == "direct":
-            self.browser = DirectBrowserClient()
-        elif browser == "cdp":
-            self.browser = CDPBrowserClient(visible_mouse=visible_mouse)
-        elif browser == "cdp-mcp":
-            self.browser = BrowserMCPClient(server="cdp")
-        else:
-            self.browser = BrowserMCPClient(server="playwright")
+        self.browser = CDPBrowserClient(visible_mouse=visible_mouse)
 
         self.tools: list[dict] = []
         self.mode: str | None = None

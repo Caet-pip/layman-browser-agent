@@ -1,3 +1,5 @@
-mcp
 openai
 python-dotenv
+playwright
+fastapi
+uvicorn[standard]

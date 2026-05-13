@@ -8,7 +8,7 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["ollama", "openai"], help="LLM backend to use")
     parser.add_argument("--model", help="Override the model name (e.g. llama3.2, qwen2.5, gpt-4o-mini)")
-    parser.add_argument("--browser", choices=["direct", "cdp", "cdp-mcp", "playwright"], default="cdp", help="Browser client to use (default: cdp)")
+    parser.add_argument("--browser", choices=["cdp"], default="cdp", help="Browser client to use (default: cdp)")
     parser.add_argument("--visible-mouse", action="store_true", help="Show visible cursor during clicks")
     args = parser.parse_args()
 
